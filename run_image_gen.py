@@ -16,19 +16,45 @@ import os
 from pathlib import Path
 from hunyuan_image_3 import HunyuanImage3ForCausalMM
 from PIL import Image
-from PE.deepseek import DeepSeekClient
-from PE.system_prompt import system_prompt_universal, system_prompt_text_rendering
 
 def parse_args():
     parser = argparse.ArgumentParser("Commandline arguments for running HunyuanImage-3 locally")
-    parser.add_argument("--prompt", type=str, required=True, help="Prompt to run")
+    parser.add_argument(
+        "--prompt", type=str, required=True,
+        help=(
+            "Prompt to run. Either a single string, multiple prompts separated by '|||' "
+            "(e.g., 'prompt1|||prompt2|||prompt3'), or a path to a JSON/JSONL file "
+            "containing a list of prompts."
+        )
+    )
+    parser.add_argument(
+        "--image-size-list",
+        type=str,
+        default=None,
+        help=(
+            "Per-sample image sizes for batch mode, separated by '|||'. "
+            "Each entry follows the same format as --image-size (e.g., '1024x1024|||1280x720'). "
+            "Length must match the number of prompts."
+        )
+    )
+    parser.add_argument(
+        "--prompt-file",
+        type=str,
+        default=None,
+        help=(
+            "Path to a JSON file with a list of prompt strings, OR a JSONL file with one "
+            "prompt per line. Mutually exclusive with the '|||' separator in --prompt."
+        )
+    )
     parser.add_argument(
         "--image",
         type=str,
         default=None,
         help=(
             "Image to run. For multiple images, use comma-separated paths "
-            "(e.g., 'img1.png,img2.png,img3.png')"
+            "(e.g., 'img1.png,img2.png,img3.png'). In batch mode (when multiple prompts "
+            "are supplied), images are loaded per-sample using the same convention: each "
+            "prompt's image list is separated by '|||' and individual images by ','."
         )
     )
     parser.add_argument("--max_new_tokens", type=int, default=2048, help="Maximum number of new tokens to generate")
@@ -71,10 +97,14 @@ def parse_args():
             "Default to load from the model generation config."
         )
     )
-    parser.add_argument("--save", type=str, default="image.png", help="Path to save the generated image")
+    parser.add_argument(
+        "--save", type=str, default="image.png",
+        help=(
+            "Path to save the generated image. In batch mode, use a directory path or a "
+            "template with '{idx}' (e.g., 'outputs/img_{idx}.png') to save each sample."
+        )
+    )
     parser.add_argument("--verbose", type=int, default=2, help="Verbose level")
-    parser.add_argument("--rewrite", type=int, default=0, help="Whether to rewrite the prompt with DeepSeek")
-
     parser.add_argument("--reproduce", action="store_true", help="Whether to reproduce the results")
     parser.add_argument(
         "--infer-align-image-size",
@@ -148,12 +178,110 @@ def set_reproducibility(enable, global_seed=None, benchmark=None):
     torch.use_deterministic_algorithms(enable)
 
 
+def parse_prompt_input(args):
+    """Parse --prompt / --prompt-file into a list of prompt strings."""
+    if args.prompt_file:
+        # Load prompts from file
+        path = Path(args.prompt_file)
+        if not path.exists():
+            raise ValueError(f"Prompt file {args.prompt_file} does not exist")
+        text = path.read_text(encoding="utf-8").strip()
+        if path.suffix.lower() == ".jsonl":
+            prompts = [line.strip() for line in text.splitlines() if line.strip()]
+        else:
+            import json
+            data = json.loads(text)
+            if isinstance(data, list):
+                prompts = [str(p) for p in data]
+            elif isinstance(data, dict) and "prompts" in data:
+                prompts = [str(p) for p in data["prompts"]]
+            else:
+                raise ValueError(
+                    f"Prompt JSON must be a list or contain a 'prompts' key, got {type(data)}."
+                )
+        return prompts
+    if "|||" in args.prompt:
+        return [p.strip() for p in args.prompt.split("|||") if p.strip()]
+    return [args.prompt]
+
+
+def parse_image_size_list(args, batch_size):
+    """Parse --image-size-list into a per-sample list aligned with `batch_size`."""
+    if not args.image_size_list:
+        return None
+    sizes = [s.strip() for s in args.image_size_list.split("|||") if s.strip()]
+    if len(sizes) != batch_size:
+        raise ValueError(
+            f"--image-size-list has {len(sizes)} entries but there are {batch_size} prompts."
+        )
+    return sizes
+
+
+def parse_image_input(args, batch_size):
+    """Parse --image into a per-sample list aligned with `batch_size`.
+
+    Convention:
+        - In single-prompt mode: comma-separated paths -> list of images for that sample.
+        - In batch mode: '|||' separates per-sample images; within each, ',' separates paths.
+    """
+    if not args.image:
+        return [None] * batch_size
+    if batch_size == 1:
+        # Backwards-compatible: comma-separated list -> list of images for the single sample
+        paths = [p.strip() for p in args.image.split(",") if p.strip()]
+        if len(paths) == 0:
+            return [None]
+        if len(paths) == 1:
+            return [paths[0]]
+        return [paths]
+    # Batch mode
+    per_sample = args.image.split("|||")
+    if len(per_sample) != batch_size:
+        raise ValueError(
+            f"--image has {len(per_sample)} per-sample entries but there are {batch_size} prompts."
+        )
+    result = []
+    for entry in per_sample:
+        entry = entry.strip()
+        if not entry:
+            result.append(None)
+            continue
+        paths = [p.strip() for p in entry.split(",") if p.strip()]
+        if len(paths) == 0:
+            result.append(None)
+        elif len(paths) == 1:
+            result.append(paths[0])
+        else:
+            result.append(paths)
+    return result
+
+
+def make_save_paths(save_arg: str, batch_size: int) -> list[str]:
+    """Resolve a save argument into one path per batch sample."""
+    if batch_size == 1:
+        return [save_arg]
+    # If the save arg contains {idx}, use template substitution
+    if "{idx}" in save_arg:
+        return [save_arg.replace("{idx}", str(i)) for i in range(batch_size)]
+    # Otherwise treat the path as a directory
+    save_dir = Path(save_arg)
+    # If the user passed a file-like path (with an extension), still create a directory of
+    # that name and number the files inside.
+    if save_dir.suffix:
+        save_dir = save_dir.parent / save_dir.stem
+    save_dir.mkdir(parents=True, exist_ok=True)
+    return [str(save_dir / f"image_{i}.png") for i in range(batch_size)]
+
+
 def main(args):
     if args.reproduce:
         set_reproducibility(args.reproduce, global_seed=args.seed)
 
-    if not args.prompt:
-        raise ValueError("Prompt is required")
+    # 1. Resolve prompt(s)
+    prompts = parse_prompt_input(args)
+    batch_size = len(prompts)
+    print(f"Batch size: {batch_size}")
+
     if not Path(args.model_id).exists():
         raise ValueError(f"Model path {args.model_id} does not exist")
 
@@ -166,65 +294,79 @@ def main(args):
     )
     model = HunyuanImage3ForCausalMM.from_pretrained(args.model_id, **kwargs)
     model.load_tokenizer(args.model_id)
-    
-    if args.image:
-        image_paths = [path.strip() for path in args.image.split(',')]
-        image_paths = [path for path in image_paths if path]
-        
-        if len(image_paths) == 0:
-            image_input = None
-        elif len(image_paths) == 1:
-            image_input = image_paths[0]
-        else:
-            image_input = image_paths
+
+    # 2. Resolve per-sample images
+    image_inputs = parse_image_input(args, batch_size)
+
+    # 3. Resolve per-sample image_size (optional)
+    image_size_list = parse_image_size_list(args, batch_size)
+    if image_size_list is None:
+        # Fall back to single shared image_size for all samples
+        image_size_arg = args.image_size
     else:
-        image_input = None
-    
-    # Rewrite prompt with DeepSeek When use HunyuanImage-3.0
-    if args.rewrite:
-        # Get request key_id and key_secret for DeepSeek
-        deepseek_key_id = os.getenv("DEEPSEEK_KEY_ID")
-        deepseek_key_secret = os.getenv("DEEPSEEK_KEY_SECRET")
-        if not deepseek_key_id or not deepseek_key_secret:
-            raise ValueError(f"DeepSeek API key is not set!!! The Pretrain Checkpoint does not "
-                             f"automatically rewrite or enhance input prompts, for optimal results currently,"
-                             f"we recommend community partners to use deepseek to rewrite the prompts.")
-        deepseek_client = DeepSeekClient(deepseek_key_id, deepseek_key_secret)
-        
-        if args.sys_deepseek_prompt == "universal":
-            system_prompt = system_prompt_universal
-        elif args.sys_deepseek_prompt == "text_rendering":
-            system_prompt = system_prompt_text_rendering
-        else:
-            raise ValueError(f"Invalid system prompt: {args.sys_deepseek_prompt}")
-        prompt, _ = deepseek_client.run_single_recaption(system_prompt, args.prompt)
-        print("rewrite prompt: {}".format(prompt))
-        args.prompt = prompt
-    cot_text, samples = model.generate_image(
-        prompt=args.prompt,
-        seed=args.seed,
-        image_size=args.image_size,
-        use_system_prompt=args.use_system_prompt,
-        system_prompt=args.system_prompt,
-        bot_task=args.bot_task,
-        diff_infer_steps=args.diff_infer_steps,
-        verbose=args.verbose,
-        max_new_tokens=args.max_new_tokens,
-        image=image_input,
-        infer_align_image_size=args.infer_align_image_size,
-        use_taylor_cache=args.use_taylor_cache,
-        taylor_cache_interval=args.taylor_cache_interval,
-        taylor_cache_order=args.taylor_cache_order,
-        taylor_cache_enable_first_enhance=args.taylor_cache_enable_first_enhance,
-        taylor_cache_first_enhance_steps=args.taylor_cache_first_enhance_steps,
-        taylor_cache_enable_tailing_enhance=args.taylor_cache_enable_tailing_enhance,
-        taylor_cache_tailing_enhance_steps=args.taylor_cache_tailing_enhance_steps,
-        taylor_cache_low_freqs_order=args.taylor_cache_low_freqs_order,
-        taylor_cache_high_freqs_order=args.taylor_cache_high_freqs_order,
-    )
-    Path(args.save).parent.mkdir(parents=True, exist_ok=True)
-    samples[0].save(args.save)
-    print(f"Image saved to {args.save}")
+        image_size_arg = image_size_list
+
+    # 4. Generate
+    if batch_size == 1:
+        # Backwards-compatible single-sample call
+        cot_text, samples = model.generate_image(
+            prompt=prompts[0],
+            seed=args.seed,
+            image_size=image_size_arg,
+            use_system_prompt=args.use_system_prompt,
+            system_prompt=args.system_prompt,
+            bot_task=args.bot_task,
+            diff_infer_steps=args.diff_infer_steps,
+            verbose=args.verbose,
+            max_new_tokens=args.max_new_tokens,
+            image=image_inputs[0],
+            infer_align_image_size=args.infer_align_image_size,
+            use_taylor_cache=args.use_taylor_cache,
+            taylor_cache_interval=args.taylor_cache_interval,
+            taylor_cache_order=args.taylor_cache_order,
+            taylor_cache_enable_first_enhance=args.taylor_cache_enable_first_enhance,
+            taylor_cache_first_enhance_steps=args.taylor_cache_first_enhance_steps,
+            taylor_cache_enable_tailing_enhance=args.taylor_cache_enable_tailing_enhance,
+            taylor_cache_tailing_enhance_steps=args.taylor_cache_tailing_enhance_steps,
+            taylor_cache_low_freqs_order=args.taylor_cache_low_freqs_order,
+            taylor_cache_high_freqs_order=args.taylor_cache_high_freqs_order,
+        )
+    else:
+        # Broadcast system_prompt to match batch size
+        system_prompt = [args.system_prompt] * batch_size if args.system_prompt is not None else None
+        cot_text, samples = model.generate_image(
+            prompt=prompts,
+            seed=args.seed,
+            image_size=image_size_arg,
+            use_system_prompt=args.use_system_prompt,
+            system_prompt=system_prompt,
+            bot_task=args.bot_task,
+            diff_infer_steps=args.diff_infer_steps,
+            verbose=args.verbose,
+            max_new_tokens=args.max_new_tokens,
+            image=image_inputs,
+            infer_align_image_size=args.infer_align_image_size,
+            use_taylor_cache=args.use_taylor_cache,
+            taylor_cache_interval=args.taylor_cache_interval,
+            taylor_cache_order=args.taylor_cache_order,
+            taylor_cache_enable_first_enhance=args.taylor_cache_enable_first_enhance,
+            taylor_cache_first_enhance_steps=args.taylor_cache_first_enhance_steps,
+            taylor_cache_enable_tailing_enhance=args.taylor_cache_enable_tailing_enhance,
+            taylor_cache_tailing_enhance_steps=args.taylor_cache_tailing_enhance_steps,
+            taylor_cache_low_freqs_order=args.taylor_cache_low_freqs_order,
+            taylor_cache_high_freqs_order=args.taylor_cache_high_freqs_order,
+        )
+
+    # 6. Save outputs
+    save_paths = make_save_paths(args.save, batch_size)
+    if not isinstance(samples, list):
+        samples = [samples]
+    assert len(samples) == batch_size, (
+        f"Generated {len(samples)} samples but expected {batch_size}.")
+    for path, img in zip(save_paths, samples):
+        Path(path).parent.mkdir(parents=True, exist_ok=True)
+        img.save(path)
+        print(f"Image saved to {path}")
 
 
 if __name__ == "__main__":

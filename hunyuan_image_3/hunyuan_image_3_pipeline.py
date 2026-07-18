@@ -503,6 +503,23 @@ class FlowMatchDiscreteScheduler(SchedulerMixin, ConfigMixin):
     def __len__(self):
         return self.config.num_train_timesteps
 
+    def _snapshot_state(self):
+        """Snapshot scheduler state for batched per-sample step() calls."""
+        return dict(
+            _step_index=self._step_index,
+            _begin_index=self._begin_index,
+            derivative_1=self.derivative_1,
+            derivative_2=self.derivative_2,
+            derivative_3=self.derivative_3,
+            dt=self.dt,
+            sample=getattr(self, "sample", None),
+        )
+
+    def _restore_state(self, state):
+        """Restore scheduler state from a snapshot."""
+        for k, v in state.items():
+            setattr(self, k, v)
+
 
 class ClassifierFreeGuidance:
     def __init__(
@@ -707,6 +724,16 @@ class HunyuanImage3Text2ImagePipeline(DiffusionPipeline):
         **kwargs,
     ):
         r"""
+        Run the diffusion pipeline.
+
+        Args:
+            batch_size: Number of samples in the batch.
+            image_size: Either a single [H, W] shared by the whole batch, or a list of per-sample
+                [H, W] pairs (length = batch_size). When a list is provided, latents are
+                per-sample tensors and the VAE decode is run per-sample so different
+                image sizes can coexist in one batch.
+        """
+        r"""
         The call function to the pipeline for generation.
 
         Args:
@@ -771,6 +798,21 @@ class HunyuanImage3Text2ImagePipeline(DiffusionPipeline):
         self._guidance_scale = guidance_scale
         self._guidance_rescale = guidance_rescale
 
+        # ------------------------------------------------------------------
+        # Resolve per-sample image_size. We always work with a list of [H, W]
+        # pairs of length batch_size in the rest of the call.
+        # ------------------------------------------------------------------
+        if isinstance(image_size[0], (list, tuple)):
+            # Per-sample sizes provided
+            assert len(image_size) == batch_size, (
+                f"image_size list length ({len(image_size)}) must match batch_size ({batch_size})."
+            )
+            image_size_list = [(int(s[0]), int(s[1])) for s in image_size]
+            per_sample_image_size = True
+        else:
+            # Single size shared by the whole batch
+            image_size_list = [(int(image_size[0]), int(image_size[1]))] * batch_size
+            per_sample_image_size = False
 
         if not kwargs.get('cfg_distilled', False):
             cfg_factor = 1 + self.do_classifier_free_guidance
@@ -784,16 +826,33 @@ class HunyuanImage3Text2ImagePipeline(DiffusionPipeline):
             self.scheduler, num_inference_steps, device, timesteps, sigmas,
         )
 
-        # Prepare latent variables
-        latents = self.prepare_latents(
-            batch_size=batch_size,
-            latent_channel=self.model.config.vae["latent_channels"],
-            image_size=image_size,
-            dtype=torch.bfloat16,
-            device=device,
-            generator=generator,
-            latents=latents,
-        )
+        # Prepare latent variables.
+        # When per-sample image_size, build a list of (B=1) latent tensors so the
+        # sampling loop can iterate over them. Otherwise build a single stacked latent.
+        if per_sample_image_size:
+            latents_list = []
+            for i, (h, w) in enumerate(image_size_list):
+                gen_i = generator[i] if isinstance(generator, list) else generator
+                z_i = self.prepare_latents(
+                    batch_size=1,
+                    latent_channel=self.model.config.vae["latent_channels"],
+                    image_size=[h, w],
+                    dtype=torch.bfloat16,
+                    device=device,
+                    generator=gen_i,
+                    latents=None,
+                )
+                latents_list.append(z_i)
+        else:
+            latents = self.prepare_latents(
+                batch_size=batch_size,
+                latent_channel=self.model.config.vae["latent_channels"],
+                image_size=list(image_size_list[0]),
+                dtype=torch.bfloat16,
+                device=device,
+                generator=generator,
+                latents=latents,
+            )
 
         # Prepare extra step kwargs.
         _scheduler_step_extra_kwargs = self.prepare_extra_func_kwargs(
@@ -805,13 +864,17 @@ class HunyuanImage3Text2ImagePipeline(DiffusionPipeline):
         attention_mask = self.model._prepare_attention_mask_for_generation(     # noqa
             input_ids, self.model.generation_config, model_kwargs=model_kwargs,
         )
-        model_kwargs["attention_mask"] = attention_mask.to(latents.device)
+        if per_sample_image_size:
+            attention_mask = attention_mask.to(latents_list[0].device)
+        else:
+            attention_mask = attention_mask.to(latents.device)
+        model_kwargs["attention_mask"] = attention_mask
 
         # Sampling loop
         num_warmup_steps = len(timesteps) - num_inference_steps * self.scheduler.order
         self._num_timesteps = len(timesteps)
 
-        # Taylor cache 
+        # Taylor cache
         cache_dic = None
         if self.model.use_taylor_cache:
             cache_dic = cache_init(
@@ -829,8 +892,13 @@ class HunyuanImage3Text2ImagePipeline(DiffusionPipeline):
 
         with self.progress_bar(total=num_inference_steps) as progress_bar:
             for i, t in enumerate(timesteps):
+                if per_sample_image_size:
+                    # Concatenate per-sample latents (each may have different spatial size).
+                    latent_model_input = torch.cat(latents_list, dim=0)
+                else:
+                    latent_model_input = latents
                 # expand the latents if we are doing classifier free guidance
-                latent_model_input = torch.cat([latents] * cfg_factor)
+                latent_model_input = torch.cat([latent_model_input] * cfg_factor)
                 latent_model_input = self.scheduler.scale_model_input(latent_model_input, t)
 
                 if meanflow:
@@ -870,7 +938,28 @@ class HunyuanImage3Text2ImagePipeline(DiffusionPipeline):
                     pred = rescale_noise_cfg(pred, pred_cond, guidance_rescale=self.guidance_rescale)
 
                 # compute the previous noisy sample x_t -> x_t-1
-                latents = self.scheduler.step(pred, t, latents, **_scheduler_step_extra_kwargs, return_dict=False)[0]
+                if per_sample_image_size:
+                    # Update each sample's latent using its own scheduler step.
+                    # The scheduler mutates internal state (step_index, derivatives), so
+                    # we need to snapshot/restore around each per-sample call.
+                    sched_state = self.scheduler._snapshot_state()
+                    per_sample_preds = list(pred)
+                    new_latents_list = []
+                    for j, pred_j in enumerate(per_sample_preds):
+                        self.scheduler._restore_state(sched_state)
+                        gen_j = generator[j] if isinstance(generator, list) else generator
+                        new_z = self.scheduler.step(
+                            pred_j, t, latents_list[j],
+                            **_scheduler_step_extra_kwargs, return_dict=False,
+                        )[0]
+                        new_latents_list.append(new_z)
+                    # Restore the final scheduler state so any subsequent logic sees a
+                    # consistent state. The per-sample scheduler step doesn't update a
+                    # "real" shared state, so we reset to the snapshot taken before.
+                    self.scheduler._restore_state(sched_state)
+                    latents_list = new_latents_list
+                else:
+                    latents = self.scheduler.step(pred, t, latents, **_scheduler_step_extra_kwargs, return_dict=False)[0]
 
                 if i != len(timesteps) - 1:
                     model_kwargs = self.model._update_model_kwargs_for_generation(  # noqa
@@ -884,33 +973,65 @@ class HunyuanImage3Text2ImagePipeline(DiffusionPipeline):
                 if callback_on_step_end is not None:
                     callback_kwargs = {}
                     for k in callback_on_step_end_tensor_inputs:
-                        callback_kwargs[k] = locals()[k]
+                        if k == "latents":
+                            if per_sample_image_size:
+                                # In per-sample mode we provide the stacked latents
+                                callback_kwargs[k] = torch.cat(latents_list, dim=0)
+                            else:
+                                callback_kwargs[k] = latents
+                        else:
+                            callback_kwargs[k] = locals().get(k)
                     callback_outputs = callback_on_step_end(self, i, t, callback_kwargs)
-
-                    latents = callback_outputs.pop("latents", latents)
+                    if not per_sample_image_size:
+                        latents = callback_outputs.pop("latents", latents)
 
                 # call the callback, if provided
                 if i == len(timesteps) - 1 or ((i + 1) > num_warmup_steps and (i + 1) % self.scheduler.order == 0):
                     progress_bar.update()
 
-        if hasattr(self.vae.config, 'scaling_factor') and self.vae.config.scaling_factor:
-            latents = latents / self.vae.config.scaling_factor
-        if hasattr(self.vae.config, 'shift_factor') and self.vae.config.shift_factor:
-            latents = latents + self.vae.config.shift_factor
+        if per_sample_image_size:
+            # VAE decode each sample independently so different sizes work together.
+            pil_images = []
+            for j, z in enumerate(latents_list):
+                if hasattr(self.vae.config, 'scaling_factor') and self.vae.config.scaling_factor:
+                    z = z / self.vae.config.scaling_factor
+                if hasattr(self.vae.config, 'shift_factor') and self.vae.config.shift_factor:
+                    z = z + self.vae.config.shift_factor
+                if hasattr(self.vae, "ffactor_temporal"):
+                    z = z.unsqueeze(2)
+                gen_j = generator[j] if isinstance(generator, list) else generator
+                with torch.autocast(device_type="cuda", dtype=torch.float16, enabled=True):
+                    img_j = self.vae.decode(z, return_dict=False, generator=gen_j)[0]
+                if hasattr(self.vae, "ffactor_temporal"):
+                    assert img_j.shape[2] == 1, "image should have shape [B, C, T, H, W] and T should be 1"
+                    img_j = img_j.squeeze(2)
+                do_denorm = [True] * img_j.shape[0]
+                pil_j = self.image_processor.postprocess(img_j, output_type=output_type, do_denormalize=do_denorm)
+                # postprocess returns a list (one PIL per batch element)
+                if isinstance(pil_j, list):
+                    pil_images.extend(pil_j)
+                else:
+                    pil_images.append(pil_j)
+            image = pil_images
+        else:
+            if hasattr(self.vae.config, 'scaling_factor') and self.vae.config.scaling_factor:
+                latents = latents / self.vae.config.scaling_factor
+            if hasattr(self.vae.config, 'shift_factor') and self.vae.config.shift_factor:
+                latents = latents + self.vae.config.shift_factor
 
-        if hasattr(self.vae, "ffactor_temporal"):
-            latents = latents.unsqueeze(2)
+            if hasattr(self.vae, "ffactor_temporal"):
+                latents = latents.unsqueeze(2)
 
-        with torch.autocast(device_type="cuda", dtype=torch.float16, enabled=True):
-            image = self.vae.decode(latents, return_dict=False, generator=generator)[0]
+            with torch.autocast(device_type="cuda", dtype=torch.float16, enabled=True):
+                image = self.vae.decode(latents, return_dict=False, generator=generator)[0]
 
-        # b c t h w
-        if hasattr(self.vae, "ffactor_temporal"):
-            assert image.shape[2] == 1, "image should have shape [B, C, T, H, W] and T should be 1"
-            image = image.squeeze(2)
+            # b c t h w
+            if hasattr(self.vae, "ffactor_temporal"):
+                assert image.shape[2] == 1, "image should have shape [B, C, T, H, W] and T should be 1"
+                image = image.squeeze(2)
 
-        do_denormalize = [True] * image.shape[0]
-        image = self.image_processor.postprocess(image, output_type=output_type, do_denormalize=do_denormalize)
+            do_denormalize = [True] * image.shape[0]
+            image = self.image_processor.postprocess(image, output_type=output_type, do_denormalize=do_denormalize)
 
         if not return_dict:
             return (image,)

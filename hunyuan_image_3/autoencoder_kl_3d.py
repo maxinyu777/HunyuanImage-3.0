@@ -833,6 +833,28 @@ class AutoencoderKLConv3D(ModelMixin, ConfigMixin):
 
         return DecoderOutput(sample=decoded)
 
+    def decode_per_sample(self, z_list, generator=None):
+        """Decode a list of per-sample latent tensors that may have different spatial sizes.
+
+        Args:
+            z_list: list of 4-D tensors `[1, C, T, H_i, W_i]`. Each sample may have its
+                own spatial size.
+            generator: optional, a single `torch.Generator` or a list aligned with `z_list`.
+
+        Returns:
+            List of decoded tensors `[1, C, T, H_dec_i, W_dec_i]`, one per sample.
+        """
+        decoded_list = []
+        for i, z in enumerate(z_list):
+            if torch.distributed.is_initialized():
+                if torch.distributed.get_rank() != 0:
+                    decoded_list.append(self.empty_cache)
+                    continue
+            gen_i = generator[i] if isinstance(generator, list) else generator
+            out = self.decode(z, return_dict=False, generator=gen_i)[0]
+            decoded_list.append(out)
+        return decoded_list
+
     def decode_dist(self, z: Tensor, return_dict: bool = True, generator=None):
         z = z.cuda()
         self.use_spatial_tiling = True
