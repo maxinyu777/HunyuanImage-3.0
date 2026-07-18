@@ -1209,20 +1209,29 @@ class HunyuanMoE(nn.Module):
                 # Flatten for easier indexing
                 flat_topk_idx = topk_idx.view(-1)
                 hidden_states_flat = input_hidden_states.view(-1, hidden_size)    # (bsz * seq_len, hidden_size)
-                hidden_states_repeated = hidden_states_flat.repeat_interleave(self.moe_topk, dim=0)  # (bsz * seq_len * k, hidden_size)
+                num_tokens = hidden_states_flat.shape[0]
 
-                # Forward through experts
-                expert_outputs = torch.zeros_like(hidden_states_repeated, dtype=hidden_states_repeated.dtype, device=hidden_states_repeated.device)
-                for i in range(self.num_experts):
-                    expert_mask = (flat_topk_idx == i)
-                    selected_inputs = hidden_states_repeated[expert_mask]
-                    expert_output = self.experts[i](selected_inputs)    # compatible with zero tensor
-                    expert_outputs[expert_mask] = expert_output
-
-                # Weighted sum of expert outputs
-                combined_output = (expert_outputs.view(
-                    bsz * seq_len, self.moe_topk, hidden_size) * topk_weights.unsqueeze(-1)).sum(dim=1)  # (bsz * seq_len, hidden_size)
-                combined_output = combined_output.to(hidden_states.dtype).view(bsz, seq_len, hidden_size)
+                # Fast path: avoid repeat_interleave + large expert_outputs tensor.
+                # Instead, group tokens by their expert assignment and process each expert directly.
+                # This is faster when num_tokens is small (e.g., bs=1, seq_len=1 or short sequences).
+                # Threshold: avoid large intermediate tensors (repeat_interleave creates num_tokens * topk hidden_size elements).
+                if num_tokens * self.moe_topk <= 8192:
+                    combined_output = self._forward_moe_grouped(
+                        hidden_states_flat, topk_weights, flat_topk_idx, num_tokens, bsz, seq_len, hidden_size
+                    )
+                else:
+                    # Standard DeepSeekMoE: repeat_interleave + per-expert loop over masked subsets
+                    hidden_states_repeated = hidden_states_flat.repeat_interleave(self.moe_topk, dim=0)  # (bsz * seq_len * k, hidden_size)
+                    expert_outputs = torch.zeros_like(hidden_states_repeated, dtype=hidden_states_repeated.dtype, device=hidden_states_repeated.device)
+                    for i in range(self.num_experts):
+                        expert_mask = (flat_topk_idx == i)
+                        selected_inputs = hidden_states_repeated[expert_mask]
+                        expert_output = self.experts[i](selected_inputs)    # compatible with zero tensor
+                        expert_outputs[expert_mask] = expert_output
+                    # Weighted sum of expert outputs
+                    combined_output = (expert_outputs.view(
+                        bsz * seq_len, self.moe_topk, hidden_size) * topk_weights.unsqueeze(-1)).sum(dim=1)  # (bsz * seq_len, hidden_size)
+                    combined_output = combined_output.to(hidden_states.dtype).view(bsz, seq_len, hidden_size)
 
         if self.config.use_mixed_mlp_moe:
             output = hidden_states_mlp + combined_output    # noqa
@@ -1230,6 +1239,50 @@ class HunyuanMoE(nn.Module):
             output = combined_output
 
         return output
+
+    def _forward_moe_grouped(self, hidden_states_flat, topk_weights, flat_topk_idx, num_tokens, bsz, seq_len, hidden_size):
+        """
+        Fast MoE forward by grouping tokens per expert assignment.
+        Avoids the expensive repeat_interleave and large expert_outputs tensor.
+        For each expert, we gather only its assigned (token, rank) pairs, run the expert,
+        and accumulate the weighted outputs.
+
+        Args:
+            hidden_states_flat: (num_tokens, hidden_size)
+            topk_weights: (num_tokens, topk)  - raw softmax weights (not normalized)
+            flat_topk_idx: (num_tokens * topk,) flattened expert indices
+                Layout: [t0_rank0, t0_rank1, ..., t0_rank(topk-1), t1_rank0, ...]
+            num_tokens: bsz * seq_len
+            bsz, seq_len, hidden_size: tensor dimensions
+        """
+        combined_output = torch.zeros_like(hidden_states_flat)  # (num_tokens, hidden_size)
+        topk = self.moe_topk
+
+        # Reshape topk_idx to (num_tokens, topk) for easier indexing
+        topk_idx = flat_topk_idx.view(num_tokens, topk)  # (num_tokens, topk)
+
+        for expert_id in range(self.num_experts):
+            # Find which (token, rank) pairs selected this expert
+            # expert_mask[j] = True where flat_topk_idx[j] == expert_id
+            expert_mask = (flat_topk_idx == expert_id)  # (num_tokens * topk,)
+            if not expert_mask.any():
+                continue
+
+            positions = torch.nonzero(expert_mask, as_tuple=False).squeeze(-1)  # (M,) positions in flat array
+            token_idx = positions // topk       # (M,) which token (0..num_tokens-1)
+            rank_idx = positions % topk         # (M,) which rank within that token's topk (0..topk-1)
+
+            # Gather inputs for this expert
+            selected_hidden = hidden_states_flat[token_idx]          # (M, hidden_size)
+            expert_out = self.experts[expert_id](selected_hidden)   # (M, hidden_size)
+
+            # Weights: topk_weights[token_idx, rank_idx]
+            weights = topk_weights[token_idx, rank_idx]             # (M,)
+
+            # Accumulate into combined_output
+            combined_output[token_idx] += (weights.unsqueeze(-1) * expert_out).to(combined_output.dtype)
+
+        return combined_output.view(bsz, seq_len, hidden_size)
 
     def _initialize_weights_on_device(self, device):
         expert_weights_gate_up = []
@@ -2348,7 +2401,12 @@ class HunyuanImage3ForCausalMM(HunyuanImage3PreTrainedModel, GenerationMixin):
             f"Input `{name}` should be a image or a list of images, but got {type(image)}."
         if not isinstance(image, list):
             image = [image]
-        batch_image_list = [image] if not isinstance(image[0], list) else image
+        # Handle batch mode: if image is a list of individual items (not nested lists)
+        # and the length matches check_batch_size, treat each item as a separate sample
+        if not isinstance(image[0], list) and check_batch_size is not None and len(image) == check_batch_size:
+            batch_image_list = [[im] for im in image]
+        else:
+            batch_image_list = [image] if not isinstance(image[0], list) else image
         for image_list in batch_image_list:
             assert all(isinstance(im, InputImage) for im in image_list), \
                 (f"Each item in `{name}` should be a PIL Image, a string path, a base64 string, or bytes, "
@@ -2644,9 +2702,27 @@ class HunyuanImage3ForCausalMM(HunyuanImage3PreTrainedModel, GenerationMixin):
                     for message_list_ in batch_message_list
                 ]
             if mode == "gen_image":
-                batch_gen_image_info = [
-                    self.image_processor.build_gen_image_info(image_size, add_guidance_token=self.config.cfg_distilled, add_timestep_r_token=self.config.use_meanflow) for _ in range(batch_size)
-                ]
+                # Support per-sample image_size when a list is provided
+                if isinstance(image_size, list):
+                    assert len(image_size) == batch_size, (
+                        f"image_size list length ({len(image_size)}) must equal batch_size ({batch_size}).")
+                    batch_gen_image_info = [
+                        self.image_processor.build_gen_image_info(
+                            image_size[i],
+                            add_guidance_token=self.config.cfg_distilled,
+                            add_timestep_r_token=self.config.use_meanflow,
+                        )
+                        for i in range(batch_size)
+                    ]
+                else:
+                    batch_gen_image_info = [
+                        self.image_processor.build_gen_image_info(
+                            image_size,
+                            add_guidance_token=self.config.cfg_distilled,
+                            add_timestep_r_token=self.config.use_meanflow,
+                        )
+                        for _ in range(batch_size)
+                    ]
             else:
                 batch_gen_image_info = [None] * batch_size
             # Convert OpenAI message list into inner message list
@@ -2662,6 +2738,10 @@ class HunyuanImage3ForCausalMM(HunyuanImage3PreTrainedModel, GenerationMixin):
             batch_prompt = self._validate_and_batchify_text(batch_prompt, 'prompt')
             batch_size = len(batch_prompt)
 
+            # Broadcast system_prompt to match batch_size if it's a single string
+            if isinstance(batch_system_prompt, str):
+                batch_system_prompt = [batch_system_prompt] * batch_size
+
             batch_cot_text = self._validate_and_batchify_text(batch_cot_text, 'cot_text', batch_size)
             batch_system_prompt = self._validate_and_batchify_text(batch_system_prompt, 'system_prompt', batch_size)
 
@@ -2676,9 +2756,26 @@ class HunyuanImage3ForCausalMM(HunyuanImage3PreTrainedModel, GenerationMixin):
                 ] if batch_image_list is not None else None
 
             if mode == "gen_image":
-                batch_gen_image_info = [
-                    self.image_processor.build_gen_image_info(image_size, add_guidance_token=self.config.cfg_distilled, add_timestep_r_token=self.config.use_meanflow) for _ in range(batch_size)
-                ]
+                if isinstance(image_size, list):
+                    assert len(image_size) == batch_size, (
+                        f"image_size list length ({len(image_size)}) must equal batch_size ({batch_size}).")
+                    batch_gen_image_info = [
+                        self.image_processor.build_gen_image_info(
+                            image_size[i],
+                            add_guidance_token=self.config.cfg_distilled,
+                            add_timestep_r_token=self.config.use_meanflow,
+                        )
+                        for i in range(batch_size)
+                    ]
+                else:
+                    batch_gen_image_info = [
+                        self.image_processor.build_gen_image_info(
+                            image_size,
+                            add_guidance_token=self.config.cfg_distilled,
+                            add_timestep_r_token=self.config.use_meanflow,
+                        )
+                        for _ in range(batch_size)
+                    ]
             else:
                 batch_gen_image_info = [None] * batch_size
 
@@ -3194,21 +3291,25 @@ class HunyuanImage3ForCausalMM(HunyuanImage3PreTrainedModel, GenerationMixin):
             batch_gen_image_info: list[ImageInfo] = kwargs.get("batch_gen_image_info")
             if batch_gen_image_info is None:
                 raise ValueError("`batch_gen_image_info` should be provided when `mode` is `gen_image`.")
-            self.num_image_tokens = (batch_gen_image_info[0].image_token_length) 
+            self.num_image_tokens = (batch_gen_image_info[0].image_token_length)
             #                       + (1 if batch_gen_image_info[0].add_timestep_token else 0)
             #                       + (1 if batch_gen_image_info[0].add_guidance_token else 0) )
-            self.num_special_tokens = ((1 if batch_gen_image_info[0].add_timestep_token else 0) + 
+            self.num_special_tokens = ((1 if batch_gen_image_info[0].add_timestep_token else 0) +
                                        (1 if batch_gen_image_info[0].add_guidance_token else 0) +
                                        (1 if batch_gen_image_info[0].add_timestep_r_token else 0) )
+            # Per-sample image_size list, or single [H, W] shared by all samples
+            image_size_arg = [
+                [info.image_height, info.image_width] for info in batch_gen_image_info
+            ]
             results = self.pipeline(
                 batch_size=len(batch_gen_image_info),
-                image_size=[batch_gen_image_info[0].image_height, batch_gen_image_info[0].image_width],
+                image_size=image_size_arg,
                 num_inference_steps=gen_config.diff_infer_steps,
                 guidance_scale=gen_config.diff_guidance_scale,
                 generator=generator,
                 meanflow=self.config.use_meanflow,
                 model_kwargs=kwargs,
-                cfg_distilled = self.config.cfg_distilled,
+                cfg_distilled=self.config.cfg_distilled,
             )
             samples = results[0]
 
@@ -3256,8 +3357,67 @@ class HunyuanImage3ForCausalMM(HunyuanImage3PreTrainedModel, GenerationMixin):
             taylor_cache_high_freqs_order=None,
             **kwargs,
     ):
+        """
+        Generate image(s) from prompt(s). Supports both single and batch inputs.
+
+        Args:
+            prompt: A single prompt string, or a list of prompt strings for batch generation.
+            image: A single image input, a list of image inputs, or a list of lists of image inputs
+                (one list per batch sample).
+            message_list: A single message list, or a list of message lists for batch generation.
+            seed: A single seed int, a list of seed ints (one per batch sample), or None.
+            image_size: "auto", a single "HxW" string, a single (H, W) tuple, or a list of these
+                (one per batch sample). When a list is given, each sample may have its own
+                target image size.
+            bot_task: One of ["image", "auto", "recaption", "think_recaption"]. Currently applied
+                uniformly to the whole batch.
+
+        Returns:
+            (cot_text, samples):
+                - cot_text: A list of CoT text strings (one per batch sample).
+                - samples: A list of PIL.Image objects (one per batch sample).
+        """
         max_new_tokens = kwargs.pop("max_new_tokens", 2048)
         cot_text = kwargs.pop("cot_text", None)
+
+        # ------------------------------------------------------------------
+        # 1. Determine batch size and broadcast single-typed inputs to lists
+        # ------------------------------------------------------------------
+        if isinstance(prompt, list):
+            batch_size = len(prompt)
+        elif message_list is not None:
+            batch_size = len(message_list) if message_list and isinstance(message_list[0], list) else 1
+            # If message_list[0] is a dict (single round), the whole message_list is one sample
+            if message_list and isinstance(message_list[0], dict):
+                batch_size = 1
+        elif isinstance(image, list):
+            batch_size = len(image)
+        else:
+            batch_size = 1
+        batch_size = max(1, batch_size)
+
+        # Broadcast image_size to list of per-sample values
+        if not isinstance(image_size, list):
+            image_size_list = [image_size] * batch_size
+        else:
+            assert len(image_size) == batch_size, (
+                f"image_size list length ({len(image_size)}) must match batch_size ({batch_size}).")
+            image_size_list = list(image_size)
+
+        # Broadcast seed
+        if seed is None:
+            seed_list = [None] * batch_size
+        elif isinstance(seed, (int, float)):
+            seed_list = [seed] * batch_size
+        elif isinstance(seed, (list, tuple)):
+            assert len(seed) == batch_size, (
+                f"seed list length ({len(seed)}) must match batch_size ({batch_size}).")
+            seed_list = list(seed)
+        elif isinstance(seed, torch.Tensor):
+            seed_list = [int(s) for s in seed.tolist()]
+            assert len(seed_list) == batch_size
+        else:
+            raise ValueError(f"seed must be int, list, tensor, or None, got {type(seed)}.")
 
         use_system_prompt = default(use_system_prompt, self.generation_config.use_system_prompt)
         bot_task = default(bot_task, self.generation_config.bot_task)
@@ -3270,13 +3430,28 @@ class HunyuanImage3ForCausalMM(HunyuanImage3PreTrainedModel, GenerationMixin):
         self.taylor_cache_first_enhance_steps = taylor_cache_first_enhance_steps
         self.taylor_cache_enable_tailing_enhance = taylor_cache_enable_tailing_enhance
         self.taylor_cache_tailing_enhance_steps = taylor_cache_tailing_enhance_steps
-        self.taylor_cache_low_freqs_order = taylor_cache_low_freqs_order 
+        self.taylor_cache_low_freqs_order = taylor_cache_low_freqs_order
         self.taylor_cache_high_freqs_order = taylor_cache_high_freqs_order
         self.use_taylor_cache = False
 
         batch_cond_images_cache = None
         tkw = self._tokenizer
-        need_ratio = image_size == "auto" or bot_task == "img_ratio"
+
+        # Whether we need to predict a ratio index (i.e. image_size is "auto")
+        # Only the FIRST sample's image_size is used to decide; we use "auto" for the batch
+        # only if all samples are "auto" (the simplest semantics).
+        if all(isinstance(s, str) and s == "auto" for s in image_size_list):
+            need_ratio = bot_task == "img_ratio" or True
+        else:
+            need_ratio = bot_task == "img_ratio"
+        # Per-sample flags (in batch mode, only run think/img_ratio once for the whole batch)
+        need_ratio_batch = any(
+            s == "auto" or bot_task == "img_ratio" for s in image_size_list
+        )
+
+        # ------------------------------------------------------------------
+        # 2. Optional CoT stage (think / recaption / think_recaption) - run batched
+        # ------------------------------------------------------------------
         if bot_task in ["think", "recaption", "think_recaption"]:
             first_bot_task = bot_task.split("_")[0]
             stage_transitions = []
@@ -3286,7 +3461,7 @@ class HunyuanImage3ForCausalMM(HunyuanImage3PreTrainedModel, GenerationMixin):
                     (tkw.end_of_think_token_id, [tkw.convert_tokens_to_ids(tkw.recaption_token)])
                 )
 
-            if need_ratio:
+            if need_ratio_batch:
                 answer_prefix_tokens = []
                 if getattr(self.generation_config, "sequence_template", "pretrain") == "instruct":
                     answer_prefix_tokens = [tkw.convert_tokens_to_ids(tkw.answer_token)]
@@ -3306,7 +3481,7 @@ class HunyuanImage3ForCausalMM(HunyuanImage3PreTrainedModel, GenerationMixin):
                     final_stop_tokens = [tkw.end_of_recaption_token_id]
                 else:
                     final_stop_tokens = [tkw.end_of_think_token_id, tkw.end_of_recaption_token_id]
-                    
+
             model_inputs = self.prepare_model_inputs(
                 prompt=prompt, image=image, message_list=message_list, system_prompt=system_prompt,
                 max_new_tokens=max_new_tokens, mode="gen_text", bot_task=first_bot_task,
@@ -3314,7 +3489,7 @@ class HunyuanImage3ForCausalMM(HunyuanImage3PreTrainedModel, GenerationMixin):
             )
             batch_cond_images_cache = model_inputs['batch_cond_images']
             logits_processor = None
-            if need_ratio:
+            if need_ratio_batch:
                 image_base_size = self.image_processor.vae_reso_group.base_size
                 logits_processor = LogitsProcessorList([
                     self._ConditionalSliceVocabLogitsProcessor(
@@ -3337,70 +3512,165 @@ class HunyuanImage3ForCausalMM(HunyuanImage3PreTrainedModel, GenerationMixin):
                     **kwargs,
                 )
             else:
-                outputs = self.generate(**model_inputs, decode_text=False, logits_processor=logits_processor, **kwargs)
-             
+                outputs = self.generate(
+                    **model_inputs, decode_text=False, logits_processor=logits_processor, **kwargs)
+
             generated_tokens = outputs[:, input_length:]
             if "recaption" in bot_task:
                 end_token_id = tkw.end_of_recaption_token_id
             else:
                 end_token_id = tkw.end_of_think_token_id
-            end_positions = (generated_tokens[0] == end_token_id).nonzero(as_tuple=False)
-            if end_positions.numel() > 0:
-                end_pos = end_positions[0].item()
-                cot_tokens = generated_tokens[0, :end_pos + 1]
-            else:
-                cot_tokens = generated_tokens[0]
-            cot_text_gen = self._tokenizer.decode(cot_tokens)
 
-            if first_bot_task == "think":
-                cot_text = [tkw.think_token + cot_text_gen]
-            else:
-                cot_text = [tkw.recaption_token + cot_text_gen]
+            cot_text = []
+            ratio_indices = []
+            for i in range(outputs.shape[0]):
+                end_positions = (generated_tokens[i] == end_token_id).nonzero(as_tuple=False)
+                if end_positions.numel() > 0:
+                    end_pos = end_positions[0].item()
+                    cot_tokens = generated_tokens[i, :end_pos + 1]
+                else:
+                    cot_tokens = generated_tokens[i]
+                cot_text_gen = self._tokenizer.decode(cot_tokens)
 
-            if self.generation_config.drop_think and tkw.think_token in cot_text[0]:
-                if tkw.recaption_token in cot_text[0]:
-                    recaption_part = cot_text[0].split(tkw.recaption_token)[1]
-                    if tkw.end_of_recaption_token in recaption_part:
-                        recaption_part = recaption_part.split(tkw.end_of_recaption_token)[0]
-                    cot_text = [tkw.recaption_token + recaption_part + tkw.end_of_recaption_token]
+                if first_bot_task == "think":
+                    cot_text_i = tkw.think_token + cot_text_gen
+                else:
+                    cot_text_i = tkw.recaption_token + cot_text_gen
 
-                    if system_prompt:
-                        system_prompt = get_system_prompt("en_recaption", bot_task)
+                if self.generation_config.drop_think and tkw.think_token in cot_text_i:
+                    if tkw.recaption_token in cot_text_i:
+                        recaption_part = cot_text_i.split(tkw.recaption_token)[1]
+                        if tkw.end_of_recaption_token in recaption_part:
+                            recaption_part = recaption_part.split(tkw.end_of_recaption_token)[0]
+                        cot_text_i = tkw.recaption_token + recaption_part + tkw.end_of_recaption_token
+                cot_text.append(cot_text_i)
 
-            if need_ratio:
-                ratio_token_id = outputs[0, -1].item()  # get the original ratio index from the generated tokens
-                ratio_index = self._get_ratio_index_from_token(ratio_token_id, tkw)
-                reso = self.image_processor.vae_reso_group[ratio_index]
-                image_size = reso.height, reso.width
+                # Capture ratio token id (last generated token of this sample)
+                if need_ratio_batch:
+                    ratio_token_id = outputs[i, -1].item()
+                    ratio_idx = self._get_ratio_index_from_token(ratio_token_id, tkw)
+                    ratio_indices.append(ratio_idx)
+                else:
+                    ratio_indices.append(None)
 
-        elif need_ratio:
+            # Update per-sample image_size_list for samples that are "auto"
+            if need_ratio_batch:
+                for i, idx in enumerate(ratio_indices):
+                    if image_size_list[i] == "auto":
+                        reso = self.image_processor.vae_reso_group[idx]
+                        image_size_list[i] = (reso.height, reso.width)
+
+            # If system prompt needed adjustment for recaption with drop_think
+            if self.generation_config.drop_think and system_prompt:
+                # Re-build system_prompt per-sample to match drop_think semantics
+                # (kept simple: all samples get the same system_prompt)
+                system_prompt = get_system_prompt("en_recaption", bot_task)
+
+        elif need_ratio_batch:
+            # img_ratio stage (no think/recaption)
             self.image_processor.build_img_ratio_slice_logits_proc(self.tokenizer)
             model_inputs = self.prepare_model_inputs(
                 prompt=prompt, image=image, cot_text=cot_text, message_list=message_list, max_new_tokens=1,
-                system_prompt=system_prompt, seed=seed, mode="gen_text", bot_task="img_ratio",
+                system_prompt=system_prompt, seed=seed_list, mode="gen_text", bot_task="img_ratio",
                 batch_cond_images=batch_cond_images_cache, infer_align_image_size=infer_align_image_size,
             )
             batch_cond_images_cache = model_inputs['batch_cond_images']
-            outputs = self.generate(**model_inputs, do_sample=False, logits_processor=self.image_processor.img_ratio_slice_logits_processor, **kwargs)
-            ratio_index = outputs[0, -1].item()
-            reso = self.image_processor.vae_reso_group[ratio_index]
-            image_size = reso.height, reso.width
+            outputs = self.generate(
+                **model_inputs, do_sample=False,
+                logits_processor=self.image_processor.img_ratio_slice_logits_processor, **kwargs)
+            ratio_indices = [int(outputs[i, -1].item()) for i in range(outputs.shape[0])]
+            for i, idx in enumerate(ratio_indices):
+                if image_size_list[i] == "auto":
+                    reso = self.image_processor.vae_reso_group[idx]
+                    image_size_list[i] = (reso.height, reso.width)
 
-        # Generate image
+        # ------------------------------------------------------------------
+        # 3. Image generation - dispatch by image_size groups
+        # ------------------------------------------------------------------
         self.use_taylor_cache = use_taylor_cache
-        model_inputs = self.prepare_model_inputs(
-            prompt=prompt, image=image, cot_text=cot_text, message_list=message_list, system_prompt=system_prompt,
-            seed=seed, image_size=image_size, mode="gen_image", batch_cond_images=batch_cond_images_cache,
-            infer_align_image_size=infer_align_image_size,
-        )
-        batch_cond_images_cache = model_inputs['batch_cond_images']
-        outputs = self.generate(**model_inputs, **kwargs)
-        self.image_processor.postprocess_outputs(
-            outputs,
+
+        # If every sample shares the same image_size, run the pipeline once for all
+        unique_sizes = {tuple(s) for s in image_size_list}
+        if len(unique_sizes) == 1:
+            samples = self._generate_image_pipeline(
+                prompt=prompt, image=image, message_list=message_list,
+                seed=seed_list, image_size=image_size_list[0],
+                cot_text=cot_text, system_prompt=system_prompt,
+                batch_cond_images_cache=batch_cond_images_cache,
+                infer_align_image_size=infer_align_image_size,
+                **kwargs,
+            )
+        else:
+            # Group samples by image_size
+            samples = [None] * batch_size
+            size_to_indices = {}
+            for i, s in enumerate(image_size_list):
+                size_to_indices.setdefault(tuple(s), []).append(i)
+
+            for size_key, indices in size_to_indices.items():
+                # Sub-select per-sample inputs that share this size
+                sub_prompt = self._index_list(prompt, indices) if isinstance(prompt, list) else prompt
+                sub_image = self._index_list(image, indices) if isinstance(image, list) else image
+                sub_message_list = self._index_list(message_list, indices) if isinstance(message_list, list) else message_list
+                sub_seed = [seed_list[i] for i in indices]
+                sub_cot_text = self._index_list(cot_text, indices) if cot_text is not None else None
+                sub_batch_cond_images = (
+                    self._index_list(batch_cond_images_cache, indices)
+                    if batch_cond_images_cache is not None else None
+                )
+                sub_samples = self._generate_image_pipeline(
+                    prompt=sub_prompt, image=sub_image, message_list=sub_message_list,
+                    seed=sub_seed, image_size=list(size_key),
+                    cot_text=sub_cot_text, system_prompt=system_prompt,
+                    batch_cond_images_cache=sub_batch_cond_images,
+                    infer_align_image_size=infer_align_image_size,
+                    **kwargs,
+                )
+                for local_i, global_i in enumerate(indices):
+                    samples[global_i] = sub_samples[local_i]
+
+        # Postprocess outputs (e.g. align with cond image sizes)
+        samples = self.image_processor.postprocess_outputs(
+            samples,
             batch_cond_images=batch_cond_images_cache,
             infer_align_image_size=infer_align_image_size,
         )
-        return cot_text, outputs
+
+        # Ensure samples is always a list (consistent with batch API)
+        if not isinstance(samples, list):
+            samples = [samples]
+
+        return cot_text, samples
+
+    @staticmethod
+    def _index_list(obj, indices):
+        """Index into a list/tuple safely, returning the same type if possible."""
+        if obj is None:
+            return None
+        return [obj[i] for i in indices]
+
+    def _generate_image_pipeline(
+            self,
+            prompt=None,
+            image=None,
+            message_list=None,
+            seed=None,
+            image_size="auto",
+            cot_text=None,
+            system_prompt=None,
+            batch_cond_images_cache=None,
+            infer_align_image_size=False,
+            **kwargs,
+    ):
+        """Run the diffusion pipeline once. Wraps prepare_model_inputs + generate(mode='gen_image')."""
+        model_inputs = self.prepare_model_inputs(
+            prompt=prompt, image=image, cot_text=cot_text, message_list=message_list,
+            system_prompt=system_prompt,
+            seed=seed, image_size=image_size, mode="gen_image",
+            batch_cond_images=batch_cond_images_cache,
+            infer_align_image_size=infer_align_image_size,
+        )
+        return self.generate(**model_inputs, **kwargs)
 
 
 __all__ = [

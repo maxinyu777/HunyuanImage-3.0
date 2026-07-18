@@ -149,3 +149,19 @@ __*/
 *.pth
 *.safetensors
 HunyuanImage-3/
+
+# ==========================================
+# HunyuanImage-3.0 specific
+# ==========================================
+# Assets (large demo images, PDFs, banners)
+assets/
+*.pdf
+
+# Test / debug files
+cat.png
+test_batch.py
+*.log
+
+# HuggingFace cache / tokenizer files (if any)
+.cache/
+tokenizer_cache/
