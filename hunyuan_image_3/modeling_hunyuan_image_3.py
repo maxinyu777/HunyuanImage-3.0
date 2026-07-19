@@ -970,10 +970,11 @@ class HunyuanStaticCache(StaticCache):
                     v_out[i].index_copy_(unbatched_dim, cache_position[i], value_states[i])
 
                 if self.dynamic:
-                    assert len(cache_position) == 1
-                    end = cache_position[0, -1].item() + 1
-                    k_out = k_out[:, :, :end]
-                    v_out = v_out[:, :, :end]
+                    # For multi-batch, only truncate if all samples have the same end position
+                    if batch_size == 1:
+                        end = cache_position[0, -1].item() + 1
+                        k_out = k_out[:, :, :end]
+                        v_out = v_out[:, :, :end]
 
         return k_out, v_out
 
