@@ -1455,7 +1455,9 @@ class HunyuanImage3SDPAAttention(nn.Module):
         print(f"[DEBUG SDPA] before reshape: {attn_output.shape}, layer_idx={self.layer_idx}")
 
         # After transpose(1,2): [B, S, H, D] - reshape to [B, S, H*D]
-        attn_output = attn_output.reshape(bsz, q_len, -1)
+        # Use actual batch size from tensor, not the local bsz variable which may be stale/mismatched
+        actual_batch = attn_output.size(0)
+        attn_output = attn_output.reshape(actual_batch, q_len, -1)
 
         # DEBUG
         print(f"[DEBUG SDPA] after reshape: {attn_output.shape}, hidden_size={self.hidden_size}, o_proj weight: {self.o_proj.weight.shape}")
