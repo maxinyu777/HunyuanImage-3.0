@@ -1431,7 +1431,7 @@ class HunyuanImage3SDPAAttention(nn.Module):
         # Reference: https://github.com/pytorch/pytorch/issues/112577.
         if query_states.device.type == "cuda" and attention_mask is not None:
             # SDPA expects attention_mask to match (batch*heads, q_len, k_len)
-            # If mask is smaller, we need to expand it properly
+            # For batch>1 with KV cache, mask shape may not be compatible - use None to fall back to causal attention
             key_seq_len = key_states.size(2)
             q_len_act = query_states.size(2)
             num_heads_total = query_states.size(1)
@@ -1439,8 +1439,11 @@ class HunyuanImage3SDPAAttention(nn.Module):
             mask_heads = attention_mask.size(1)
             mask_q = attention_mask.size(2)
             mask_k = attention_mask.size(3)
-            if mask_bsz != bsz or mask_heads != num_heads_total or mask_q != q_len_act or mask_k != key_seq_len:
-                attention_mask = attention_mask.expand(bsz, num_heads_total, q_len_act, key_seq_len)
+            if mask_bsz == bsz and mask_heads == num_heads_total and mask_q == q_len_act and mask_k == key_seq_len:
+                attention_mask = attention_mask.contiguous()
+            else:
+                # Mask shape mismatch - skip custom mask, SDPA will use default causal attention
+                attention_mask = None
             query_states = query_states.contiguous()
             key_states = key_states.contiguous()
             value_states = value_states.contiguous()
