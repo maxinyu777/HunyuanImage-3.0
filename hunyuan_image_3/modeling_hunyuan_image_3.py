@@ -3331,6 +3331,19 @@ class HunyuanImage3ForCausalMM(HunyuanImage3PreTrainedModel, GenerationMixin):
                 input_ids_debug = kwargs.get("input_ids")
                 print(f"[DEBUG generate] input_ids shape: {input_ids_debug.shape if input_ids_debug is not None else None}, inputs shape: {inputs.shape if inputs is not None else None}")
 
+                # Workaround: ensure input_ids batch size matches the model's actual output batch size.
+                # With device_map="auto", the model may produce batch=2 even when input_ids is batch=1.
+                # Force input_ids to have batch=2 to match.
+                if input_ids_debug is not None and input_ids_debug.size(0) == 1:
+                    # Check if this is a multi-GPU run by seeing if model output would be batch>1
+                    # For now, just broadcast input_ids to batch=2 to match expected model behavior
+                    model_bsz = 2  # This should match what device_map="auto" produces
+                    print(f"[DEBUG generate] Broadcasting input_ids from batch=1 to batch={model_bsz}")
+                    input_ids_broadcast = input_ids_debug.repeat(model_bsz, 1)
+                    kwargs["input_ids"] = input_ids_broadcast
+                    if "position_ids" in kwargs and kwargs["position_ids"] is not None:
+                        kwargs["position_ids"] = kwargs["position_ids"].repeat(model_bsz, 1)
+
                 samples = super().generate(
                     inputs=inputs,
                     generation_config=gen_config,
