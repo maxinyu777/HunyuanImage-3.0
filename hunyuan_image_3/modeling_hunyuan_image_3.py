@@ -3314,6 +3314,10 @@ class HunyuanImage3ForCausalMM(HunyuanImage3PreTrainedModel, GenerationMixin):
                     )
                     kwargs["eos_token_id"] = final_stop_tokens
 
+                # DEBUG: check input shapes before super().generate()
+                input_ids_debug = kwargs.get("input_ids")
+                print(f"[DEBUG generate] input_ids shape: {input_ids_debug.shape if input_ids_debug is not None else None}, inputs shape: {inputs.shape if inputs is not None else None}")
+
                 samples = super().generate(
                     inputs=inputs,
                     generation_config=gen_config,
