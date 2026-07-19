@@ -1392,12 +1392,19 @@ class HunyuanImage3SDPAAttention(nn.Module):
         qkv_states = self.qkv_proj(hidden_states)
         qkv_states = qkv_states.reshape(bsz, q_len, self.num_key_value_heads, self.num_key_value_groups + 2,
                                         self.head_dim)
+
+        # DEBUG: print shapes after projection
+        if qkv_states.size(0) != bsz:
+            print(f"[DEBUG SDPA] qkv_states={qkv_states.shape} vs bsz={bsz}, layer_idx={self.layer_idx}")
+
         query_states, key_states, value_states = torch.split(qkv_states, [self.num_key_value_groups, 1, 1], dim=3)
 
         # Ensure key/value have correct batch dim (workaround for accelerate device_map edge cases)
         if key_states.size(0) != bsz:
+            print(f"[DEBUG SDPA] key_states batch mismatch: {key_states.shape} vs bsz={bsz}, layer_idx={self.layer_idx}")
             key_states = key_states.repeat(bsz, 1, 1, 1)
         if value_states.size(0) != bsz:
+            print(f"[DEBUG SDPA] value_states batch mismatch: {value_states.shape} vs bsz={bsz}, layer_idx={self.layer_idx}")
             value_states = value_states.repeat(bsz, 1, 1, 1)
 
         query_states = query_states.reshape(bsz, q_len, self.num_heads, self.head_dim).transpose(1, 2)
