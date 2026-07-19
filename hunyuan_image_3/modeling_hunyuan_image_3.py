@@ -952,12 +952,14 @@ class HunyuanStaticCache(StaticCache):
             else:
                 assert cache_position.dim() == 2, f"multiple batch dims not yet {cache_position.shape=}"
                 batch_size, idx_size = cache_position.shape
-                # DEBUG: print shapes before assertion
-                if not (batch_size == k_out.size(0) == v_out.size(0) == key_states.size(0) == value_states.size(0)):
-                    print(f"[DEBUG] Cache update mismatch at layer {layer_idx}: "
-                          f"cache batch={batch_size}, k_out={k_out.shape}, v_out={v_out.shape}, "
-                          f"key_states={key_states.shape}, value_states={value_states.shape}, "
-                          f"cache_position={cache_position.shape}")
+
+                # Workaround for accelerate device_map batch mismatch: if key/value have wrong batch dim,
+                # broadcast to match expected batch_size
+                if key_states.size(0) == 1 and batch_size > 1:
+                    key_states = key_states.expand(batch_size, -1, -1, -1).contiguous()
+                if value_states.size(0) == 1 and batch_size > 1:
+                    value_states = value_states.expand(batch_size, -1, -1, -1).contiguous()
+
                 assert batch_size == k_out.size(0)
                 assert batch_size == v_out.size(0)
                 assert batch_size == key_states.size(0)
@@ -1392,22 +1394,13 @@ class HunyuanImage3SDPAAttention(nn.Module):
         qkv_states = self.qkv_proj(hidden_states)
         qkv_states = qkv_states.reshape(bsz, q_len, self.num_key_value_heads, self.num_key_value_groups + 2,
                                         self.head_dim)
-
-        # DEBUG: print shapes after projection
-        if qkv_states.size(0) != bsz:
-            print(f"[DEBUG SDPA] qkv_states={qkv_states.shape} vs bsz={bsz}, layer_idx={self.layer_idx}")
-
         query_states, key_states, value_states = torch.split(qkv_states, [self.num_key_value_groups, 1, 1], dim=3)
 
         # Ensure key/value have correct batch dim (workaround for accelerate device_map edge cases)
         if key_states.size(0) != bsz:
-            print(f"[DEBUG SDPA] key_states before expand: {key_states.shape}, layer_idx={self.layer_idx}")
             key_states = key_states.expand(bsz, -1, -1, -1).contiguous().clone()
-            print(f"[DEBUG SDPA] key_states after expand: {key_states.shape}")
         if value_states.size(0) != bsz:
-            print(f"[DEBUG SDPA] value_states before expand: {value_states.shape}, layer_idx={self.layer_idx}")
             value_states = value_states.expand(bsz, -1, -1, -1).contiguous().clone()
-            print(f"[DEBUG SDPA] value_states after expand: {value_states.shape}")
 
         query_states = query_states.reshape(bsz, q_len, self.num_heads, self.head_dim).transpose(1, 2)
         key_states = key_states.reshape(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
@@ -1425,19 +1418,12 @@ class HunyuanImage3SDPAAttention(nn.Module):
         key_states = key_states.to(value_states.dtype)
 
         if past_key_value is not None:
-            # DEBUG: print shapes before cache update
-            if value_states.size(0) != bsz:
-                print(f"[DEBUG before cache update] value_states={value_states.shape} vs bsz={bsz}, layer_idx={self.layer_idx}")
             cache_kwargs = {"cache_position": position_ids}
             key_states, value_states = past_key_value.update(key_states, value_states, self.layer_idx, cache_kwargs)
             query_states = query_states.to(key_states.dtype)
 
         key_states = repeat_kv(key_states, self.num_key_value_groups)
         value_states = repeat_kv(value_states, self.num_key_value_groups)
-
-        # DEBUG: print shapes before SDPA
-        if value_states.size(0) != bsz:
-            print(f"[DEBUG before SDPA] value_states={value_states.shape} vs bsz={bsz}, layer_idx={self.layer_idx}")
 
         # SDPA with memory-efficient backend is currently (torch==2.1.2) bugged with non-contiguous inputs with
         # custom attn_mask,
