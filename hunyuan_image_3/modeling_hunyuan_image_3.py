@@ -1402,10 +1402,10 @@ class HunyuanImage3SDPAAttention(nn.Module):
         # Ensure key/value have correct batch dim (workaround for accelerate device_map edge cases)
         if key_states.size(0) != bsz:
             print(f"[DEBUG SDPA] key_states batch mismatch: {key_states.shape} vs bsz={bsz}, layer_idx={self.layer_idx}")
-            key_states = key_states.repeat(bsz, 1, 1, 1)
+            key_states = key_states.expand(bsz, -1, -1, -1).contiguous().clone()
         if value_states.size(0) != bsz:
             print(f"[DEBUG SDPA] value_states batch mismatch: {value_states.shape} vs bsz={bsz}, layer_idx={self.layer_idx}")
-            value_states = value_states.repeat(bsz, 1, 1, 1)
+            value_states = value_states.expand(bsz, -1, -1, -1).contiguous().clone()
 
         query_states = query_states.reshape(bsz, q_len, self.num_heads, self.head_dim).transpose(1, 2)
         key_states = key_states.reshape(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
