@@ -952,6 +952,12 @@ class HunyuanStaticCache(StaticCache):
             else:
                 assert cache_position.dim() == 2, f"multiple batch dims not yet {cache_position.shape=}"
                 batch_size, idx_size = cache_position.shape
+                # DEBUG: print shapes before assertion
+                if not (batch_size == k_out.size(0) == v_out.size(0) == key_states.size(0) == value_states.size(0)):
+                    print(f"[DEBUG] Cache update mismatch at layer {layer_idx}: "
+                          f"cache batch={batch_size}, k_out={k_out.shape}, v_out={v_out.shape}, "
+                          f"key_states={key_states.shape}, value_states={value_states.shape}, "
+                          f"cache_position={cache_position.shape}")
                 assert batch_size == k_out.size(0)
                 assert batch_size == v_out.size(0)
                 assert batch_size == key_states.size(0)
