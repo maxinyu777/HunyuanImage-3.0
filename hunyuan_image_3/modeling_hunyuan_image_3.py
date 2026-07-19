@@ -3295,6 +3295,10 @@ class HunyuanImage3ForCausalMM(HunyuanImage3PreTrainedModel, GenerationMixin):
             start_time = time.time()
 
         if mode == "gen_text":
+            # DEBUG: check output tokens shape from tokenizer_output
+            tokenizer_output_debug = kwargs.get("tokenizer_output")
+            if tokenizer_output_debug is not None:
+                print(f"[DEBUG generate entry] tokenizer_output.tokens shape: {tokenizer_output_debug.tokens.shape}")
             if verbose >= 2 and streamer is None:
                 streamer = TextStreamer(self._tokenizer, skip_prompt=True, skip_special_tokens=False)   # noqa
 
