@@ -1430,6 +1430,17 @@ class HunyuanImage3SDPAAttention(nn.Module):
         # custom attn_mask,
         # Reference: https://github.com/pytorch/pytorch/issues/112577.
         if query_states.device.type == "cuda" and attention_mask is not None:
+            # SDPA expects attention_mask to match (batch*heads, q_len, k_len)
+            # If mask is smaller, we need to expand it properly
+            key_seq_len = key_states.size(2)
+            q_len_act = query_states.size(2)
+            num_heads_total = query_states.size(1)
+            mask_bsz = attention_mask.size(0)
+            mask_heads = attention_mask.size(1)
+            mask_q = attention_mask.size(2)
+            mask_k = attention_mask.size(3)
+            if mask_bsz != bsz or mask_heads != num_heads_total or mask_q != q_len_act or mask_k != key_seq_len:
+                attention_mask = attention_mask.expand(bsz, num_heads_total, q_len_act, key_seq_len)
             query_states = query_states.contiguous()
             key_states = key_states.contiguous()
             value_states = value_states.contiguous()
