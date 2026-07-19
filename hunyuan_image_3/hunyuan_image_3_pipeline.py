@@ -870,6 +870,22 @@ class HunyuanImage3Text2ImagePipeline(DiffusionPipeline):
             attention_mask = attention_mask.to(latents.device)
         model_kwargs["attention_mask"] = attention_mask
 
+        # Expand text conditioning tensors for CFG (Classifier-Free Guidance)
+        # When cfg_factor > 1, we duplicate the conditioning to match the doubled latent batch
+        if cfg_factor > 1:
+            # input_ids: duplicate for cond + uncond
+            input_ids = input_ids.repeat(cfg_factor, 1)
+            # attention_mask: duplicate
+            attention_mask = attention_mask.repeat(cfg_factor, 1, 1)
+            model_kwargs["attention_mask"] = attention_mask
+            # Expand scatter indices for doubled batch
+            for key in ["guidance_index", "timesteps_index", "timesteps_r_index",
+                        "gen_timestep_scatter_index", "cond_timestep_index"]:
+                if key in model_kwargs and model_kwargs[key] is not None:
+                    idx = model_kwargs[key]
+                    if isinstance(idx, torch.Tensor):
+                        model_kwargs[key] = idx.repeat(cfg_factor, 1)
+
         # Sampling loop
         num_warmup_steps = len(timesteps) - num_inference_steps * self.scheduler.order
         self._num_timesteps = len(timesteps)
@@ -914,8 +930,11 @@ class HunyuanImage3Text2ImagePipeline(DiffusionPipeline):
                     cache_dic['current_step'] = i
                     model_kwargs['cache_dic'] = cache_dic
                 if kwargs.get('cfg_distilled', False):
+                    guidance_val = 1000.0 * self._guidance_scale
+                    # Expand guidance to match batch size (CFG doubles the batch)
+                    guidance_bsz = latent_model_input.shape[0]
                     model_kwargs["guidance"] = torch.tensor(
-                        [1000.0*self._guidance_scale], device=self.device, dtype=torch.bfloat16
+                        [guidance_val] * guidance_bsz, device=self.device, dtype=torch.bfloat16
                     )
                 model_inputs = self.model.prepare_inputs_for_generation(
                     input_ids,

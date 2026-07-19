@@ -1451,16 +1451,9 @@ class HunyuanImage3SDPAAttention(nn.Module):
             query_states, key_states, value_states, attn_mask=attention_mask, dropout_p=0.0
         )
         attn_output = attn_output.transpose(1, 2).contiguous()
-        # DEBUG
-        print(f"[DEBUG SDPA] before reshape: {attn_output.shape}, layer_idx={self.layer_idx}")
 
         # After transpose(1,2): [B, S, H, D] - reshape to [B, S, H*D]
-        # Use actual batch size from tensor, not the local bsz variable which may be stale/mismatched
-        actual_batch = attn_output.size(0)
-        attn_output = attn_output.reshape(actual_batch, q_len, -1)
-
-        # DEBUG
-        print(f"[DEBUG SDPA] after reshape: {attn_output.shape}, hidden_size={self.hidden_size}, o_proj weight: {self.o_proj.weight.shape}")
+        attn_output = attn_output.reshape(attn_output.size(0), q_len, -1)
 
         attn_output = self.o_proj(attn_output)
 
@@ -2470,7 +2463,12 @@ class HunyuanImage3ForCausalMM(HunyuanImage3PreTrainedModel, GenerationMixin):
             seeds = [seed for _ in range(batch_size)]
         elif isinstance(seed, (list, tuple)):
             if len(seed) == batch_size:
-                seeds = [int(seed[i]) for i in range(batch_size)]
+                seeds = []
+                for i in range(batch_size):
+                    s = seed[i]
+                    if s is None:
+                        s = random.randint(0, 10_000_000)
+                    seeds.append(int(s))
             else:
                 raise ValueError(f"Length of seed must be equal to the batch_size({batch_size}), got {seed}.")
         else:
@@ -3041,7 +3039,7 @@ class HunyuanImage3ForCausalMM(HunyuanImage3PreTrainedModel, GenerationMixin):
 
         # Workaround: if input_ids batch size doesn't match position_ids batch size,
         # broadcast input_ids to match. This can happen with accelerate device_map.
-        if "input_ids" in model_inputs and position_ids is not None:
+        if model_inputs.get("input_ids") is not None and position_ids is not None:
             input_ids_bsz = model_inputs["input_ids"].size(0)
             pos_ids_bsz = position_ids.size(0)
             if input_ids_bsz != pos_ids_bsz:
@@ -3304,11 +3302,8 @@ class HunyuanImage3ForCausalMM(HunyuanImage3PreTrainedModel, GenerationMixin):
             start_time = time.time()
 
         if mode == "gen_text":
-            # DEBUG: check output tokens shape from tokenizer_output
-            tokenizer_output_debug = kwargs.get("tokenizer_output")
-            if tokenizer_output_debug is not None:
-                print(f"[DEBUG generate entry] tokenizer_output.tokens shape: {tokenizer_output_debug.tokens.shape}")
-            if verbose >= 2 and streamer is None:
+            # TextStreamer only supports batch_size=1
+            if verbose >= 2 and streamer is None and output.tokens.shape[0] == 1:
                 streamer = TextStreamer(self._tokenizer, skip_prompt=True, skip_special_tokens=False)   # noqa
 
             with torch.autocast(device_type="cuda", dtype=self.dtype, enabled=self.dtype != torch.float32):
@@ -3326,23 +3321,6 @@ class HunyuanImage3ForCausalMM(HunyuanImage3PreTrainedModel, GenerationMixin):
                         self._StageTransitionLogitsProcessor(stage_transitions, input_ids.shape[0])
                     )
                     kwargs["eos_token_id"] = final_stop_tokens
-
-                # DEBUG: check input shapes before super().generate()
-                input_ids_debug = kwargs.get("input_ids")
-                print(f"[DEBUG generate] input_ids shape: {input_ids_debug.shape if input_ids_debug is not None else None}, inputs shape: {inputs.shape if inputs is not None else None}")
-
-                # Workaround: ensure input_ids batch size matches the model's actual output batch size.
-                # With device_map="auto", the model may produce batch=2 even when input_ids is batch=1.
-                # Force input_ids to have batch=2 to match.
-                if input_ids_debug is not None and input_ids_debug.size(0) == 1:
-                    # Check if this is a multi-GPU run by seeing if model output would be batch>1
-                    # For now, just broadcast input_ids to batch=2 to match expected model behavior
-                    model_bsz = 2  # This should match what device_map="auto" produces
-                    print(f"[DEBUG generate] Broadcasting input_ids from batch=1 to batch={model_bsz}")
-                    input_ids_broadcast = input_ids_debug.repeat(model_bsz, 1)
-                    kwargs["input_ids"] = input_ids_broadcast
-                    if "position_ids" in kwargs and kwargs["position_ids"] is not None:
-                        kwargs["position_ids"] = kwargs["position_ids"].repeat(model_bsz, 1)
 
                 samples = super().generate(
                     inputs=inputs,

@@ -259,6 +259,13 @@ def parse_image_input(args, batch_size):
 def make_save_paths(save_arg: str, batch_size: int) -> list[str]:
     """Resolve a save argument into one path per batch sample."""
     if batch_size == 1:
+        # Ensure we have a valid path with a filename for single image
+        p = Path(save_arg) if save_arg else None
+        if not save_arg or (p and not p.name):
+            save_arg = "image.png"
+        elif p and not p.suffix and p.is_dir():
+            # save_arg is a directory path with no filename - use default
+            save_arg = "image.png"
         return [save_arg]
     # If the save arg contains {idx}, use template substitution
     if "{idx}" in save_arg:

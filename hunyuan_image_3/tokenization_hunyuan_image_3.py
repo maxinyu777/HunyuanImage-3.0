@@ -1310,7 +1310,7 @@ class HunyuanImage3TokenizerFast(PreTrainedTokenizerFast):
                 f"When batchify is True, message_list should be a list of list, but got [{type(message_list[0])}, ...]."
             return self.batch_gen_infer(
                 infer_fn=self.apply_general_template,
-                prompt_list=[[]],
+                prompt_list=[[]] * len(message_list),
                 infer_fn_kwargs_list=[dict(
                     message_list=message_list_i,
                     max_length=max_length,
