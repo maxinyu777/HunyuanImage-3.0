@@ -1394,6 +1394,12 @@ class HunyuanImage3SDPAAttention(nn.Module):
                                         self.head_dim)
         query_states, key_states, value_states = torch.split(qkv_states, [self.num_key_value_groups, 1, 1], dim=3)
 
+        # Ensure key/value have correct batch dim (workaround for accelerate device_map edge cases)
+        if key_states.size(0) != bsz:
+            key_states = key_states.repeat(bsz, 1, 1, 1)
+        if value_states.size(0) != bsz:
+            value_states = value_states.repeat(bsz, 1, 1, 1)
+
         query_states = query_states.reshape(bsz, q_len, self.num_heads, self.head_dim).transpose(1, 2)
         key_states = key_states.reshape(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
         value_states = value_states.reshape(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
