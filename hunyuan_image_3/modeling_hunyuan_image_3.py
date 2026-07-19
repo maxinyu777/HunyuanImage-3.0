@@ -1452,14 +1452,13 @@ class HunyuanImage3SDPAAttention(nn.Module):
         )
         attn_output = attn_output.transpose(1, 2).contiguous()
         # DEBUG
-        if attn_output.size(1) != self.num_heads * self.head_dim:
-            print(f"[DEBUG SDPA] attn_output before reshape: {attn_output.shape}, expected heads*dim={self.num_heads * self.head_dim}, layer_idx={self.layer_idx}")
+        print(f"[DEBUG SDPA] before reshape: {attn_output.shape}, layer_idx={self.layer_idx}")
 
+        # After transpose(1,2): [B, S, H, D] - reshape to [B, S, H*D]
         attn_output = attn_output.reshape(bsz, q_len, -1)
 
         # DEBUG
-        if attn_output.size(-1) != self.hidden_size:
-            print(f"[DEBUG SDPA] attn_output after reshape: {attn_output.shape}, hidden_size={self.hidden_size}, o_proj weight: {self.o_proj.weight.shape}")
+        print(f"[DEBUG SDPA] after reshape: {attn_output.shape}, hidden_size={self.hidden_size}, o_proj weight: {self.o_proj.weight.shape}")
 
         attn_output = self.o_proj(attn_output)
 
