@@ -3039,6 +3039,15 @@ class HunyuanImage3ForCausalMM(HunyuanImage3PreTrainedModel, GenerationMixin):
                 input_ids = torch.gather(input_ids, dim=1, index=position_ids)
             model_inputs = {"input_ids": input_ids}
 
+        # Workaround: if input_ids batch size doesn't match position_ids batch size,
+        # broadcast input_ids to match. This can happen with accelerate device_map.
+        if "input_ids" in model_inputs and position_ids is not None:
+            input_ids_bsz = model_inputs["input_ids"].size(0)
+            pos_ids_bsz = position_ids.size(0)
+            if input_ids_bsz != pos_ids_bsz:
+                # Broadcast input_ids to match position_ids batch size
+                model_inputs["input_ids"] = model_inputs["input_ids"].repeat(pos_ids_bsz, 1)
+
         model_inputs.update(
             {
                 "attention_mask": attention_mask,
