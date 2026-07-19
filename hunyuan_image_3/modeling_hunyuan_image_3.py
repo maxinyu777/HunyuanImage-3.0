@@ -1016,8 +1016,15 @@ class CachedRoPE(object):
             # Typically for inference
             assert position_ids.dim() == 2, f"{position_ids.shape=}"
             head_size = self.cos_cache.size(-1)
-            cos = torch.gather(self.cos_cache, dim=1, index=position_ids.unsqueeze(-1).expand(-1, -1, head_size))
-            sin = torch.gather(self.sin_cache, dim=1, index=position_ids.unsqueeze(-1).expand(-1, -1, head_size))
+            # Expand cos_cache/sin_cache to match position_ids batch size if needed
+            bsz = position_ids.size(0)
+            if self.cos_cache.size(0) == 1 and bsz > 1:
+                cos_cache = self.cos_cache.expand(bsz, -1, -1)
+                sin_cache = self.sin_cache.expand(bsz, -1, -1)
+            else:
+                cos_cache, sin_cache = self.cos_cache, self.sin_cache
+            cos = torch.gather(cos_cache, dim=1, index=position_ids.unsqueeze(-1).expand(-1, -1, head_size))
+            sin = torch.gather(sin_cache, dim=1, index=position_ids.unsqueeze(-1).expand(-1, -1, head_size))
 
         return cos, sin
 
