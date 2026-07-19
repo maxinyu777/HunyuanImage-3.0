@@ -1425,12 +1425,19 @@ class HunyuanImage3SDPAAttention(nn.Module):
         key_states = key_states.to(value_states.dtype)
 
         if past_key_value is not None:
+            # DEBUG: print shapes before cache update
+            if value_states.size(0) != bsz:
+                print(f"[DEBUG before cache update] value_states={value_states.shape} vs bsz={bsz}, layer_idx={self.layer_idx}")
             cache_kwargs = {"cache_position": position_ids}
             key_states, value_states = past_key_value.update(key_states, value_states, self.layer_idx, cache_kwargs)
             query_states = query_states.to(key_states.dtype)
 
         key_states = repeat_kv(key_states, self.num_key_value_groups)
         value_states = repeat_kv(value_states, self.num_key_value_groups)
+
+        # DEBUG: print shapes before SDPA
+        if value_states.size(0) != bsz:
+            print(f"[DEBUG before SDPA] value_states={value_states.shape} vs bsz={bsz}, layer_idx={self.layer_idx}")
 
         # SDPA with memory-efficient backend is currently (torch==2.1.2) bugged with non-contiguous inputs with
         # custom attn_mask,
